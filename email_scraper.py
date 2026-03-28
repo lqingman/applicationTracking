@@ -188,7 +188,7 @@ def _iter_folder(folder, cutoff: datetime):
         return
 
     # Outlook DASL filter — much faster than iterating all items
-    cutoff_str = cutoff.strftime("%m/%d/%Y %H:%M %p")
+    cutoff_str = cutoff.strftime("%m/%d/%Y %I:%M %p")
     restriction = f"[ReceivedTime] >= '{cutoff_str}'"
 
     try:
