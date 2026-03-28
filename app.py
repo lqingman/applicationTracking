@@ -1,0 +1,146 @@
+"""
+app.py
+Flask server — serves the dashboard and exposes the JSON API.
+"""
+
+from flask import Flask, jsonify, render_template, request
+import sqlite3
+import os
+import json
+from collections import defaultdict
+from datetime import datetime
+
+app = Flask(__name__)
+DB_PATH = os.path.join(os.path.dirname(__file__), "applications.db")
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def ensure_db():
+    """Create DB if it doesn't exist yet."""
+    from email_scraper import init_db
+    init_db()
+
+# ── API Routes ─────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("dashboard.html")
+
+
+@app.route("/api/stats")
+def api_stats():
+    ensure_db()
+    conn = get_db()
+
+    total     = conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+    by_status = conn.execute(
+        "SELECT status, COUNT(*) as cnt FROM applications GROUP BY status"
+    ).fetchall()
+
+    status_map = {row["status"]: row["cnt"] for row in by_status}
+
+    # Applications per month (last 12 months)
+    monthly = conn.execute("""
+        SELECT strftime('%Y-%m', date) as month, COUNT(*) as cnt
+        FROM applications
+        WHERE date >= date('now', '-12 months')
+        GROUP BY month
+        ORDER BY month
+    """).fetchall()
+
+    # Top 10 companies
+    top_companies = conn.execute("""
+        SELECT company, COUNT(*) as cnt
+        FROM applications
+        WHERE company != 'Unknown'
+        GROUP BY company
+        ORDER BY cnt DESC
+        LIMIT 10
+    """).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "total":         total,
+        "applied":       status_map.get("Applied", 0),
+        "interview":     status_map.get("Interview", 0),
+        "offer":         status_map.get("Offer", 0),
+        "rejected":      status_map.get("Rejected", 0),
+        "status_chart":  [{"status": k, "count": v} for k, v in status_map.items()],
+        "monthly":       [{"month": r["month"], "count": r["cnt"]} for r in monthly],
+        "top_companies": [{"company": r["company"], "count": r["cnt"]} for r in top_companies],
+    })
+
+
+@app.route("/api/applications")
+def api_applications():
+    ensure_db()
+    conn = get_db()
+
+    search  = request.args.get("q", "").strip()
+    status  = request.args.get("status", "").strip()
+    sort    = request.args.get("sort", "date")
+    order   = request.args.get("order", "desc").upper()
+    page    = max(1, int(request.args.get("page", 1)))
+    per_page = 25
+
+    allowed_sorts = {"date", "company", "status", "job_title"}
+    if sort not in allowed_sorts:
+        sort = "date"
+    if order not in ("ASC", "DESC"):
+        order = "DESC"
+
+    conditions = []
+    params: list = []
+
+    if search:
+        conditions.append("(company LIKE ? OR job_title LIKE ? OR subject LIKE ? OR sender LIKE ?)")
+        q = f"%{search}%"
+        params.extend([q, q, q, q])
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    total_rows = conn.execute(
+        f"SELECT COUNT(*) FROM applications {where}", params
+    ).fetchone()[0]
+
+    rows = conn.execute(
+        f"""SELECT * FROM applications {where}
+            ORDER BY {sort} {order}
+            LIMIT ? OFFSET ?""",
+        params + [per_page, (page - 1) * per_page]
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "total": total_rows,
+        "page":  page,
+        "pages": max(1, -(-total_rows // per_page)),
+        "items": [dict(r) for r in rows],
+    })
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    """Trigger a fresh Outlook scan (runs synchronously — may take a moment)."""
+    try:
+        from email_scraper import scan_inbox
+        result = scan_inbox()
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    ensure_db()
+    print("Dashboard running at http://localhost:5000")
+    app.run(debug=False, port=5000)
