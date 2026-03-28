@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pyc
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Local database (contains your personal email data)
+applications.db
+
+# Credentials — never commit this!
+config.py
+
+# OAuth2 token cache (contains your login session)
+token_cache.json
+
+# Environment variables / secrets
+.env
+*.env.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Distribution / packaging
+*.whl
+*.egg-info/

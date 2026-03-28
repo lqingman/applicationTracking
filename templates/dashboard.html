@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Application Tracker — Dashboard</title>
+  <meta name="description" content="Analyse your job application emails from Outlook with charts, stats, and a searchable table." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+
+  <style>
+    /* ── Reset & tokens ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0d0f18;
+      --bg2:         #141624;
+      --bg3:         #1c1f35;
+      --bg4:         #252945;
+      --border:      #2a2e4a;
+      --text:        #e2e8f0;
+      --muted:       #7c85b0;
+      --accent:      #6c63ff;
+      --accent2:     #8b5cf6;
+      --teal:        #14b8a6;
+      --amber:       #f59e0b;
+      --rose:        #f43f5e;
+      --green:       #22c55e;
+      --blue:        #3b82f6;
+
+      --card-radius: 16px;
+      --shadow:      0 4px 24px rgba(0,0,0,.45);
+      --glow:        0 0 40px rgba(108,99,255,.15);
+      --transition:  .2s ease;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.6;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────── */
+    .app { display: flex; flex-direction: column; min-height: 100vh; }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      background: linear-gradient(135deg, #0d0f18 0%, #1a1240 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+
+    .header-brand {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+    }
+
+    .logo-icon {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.2rem;
+      box-shadow: 0 0 20px rgba(108,99,255,.4);
+    }
+
+    .brand-text h1 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #fff 30%, var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-text p {
+      font-size: .72rem;
+      color: var(--muted);
+      letter-spacing: .04em;
+    }
+
+    .header-actions { display: flex; align-items: center; gap: 1rem; }
+
+    .last-sync {
+      font-size: .8rem;
+      color: var(--muted);
+    }
+
+    #scan-btn {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      padding: .6rem 1.25rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-family: inherit;
+      font-size: .88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: var(--transition);
+      box-shadow: 0 4px 15px rgba(108,99,255,.4);
+    }
+
+    #scan-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(108,99,255,.5); }
+    #scan-btn:active { transform: translateY(0); }
+    #scan-btn.loading { opacity: .7; pointer-events: none; }
+    #scan-btn .spin { display: none; animation: spin .8s linear infinite; }
+    #scan-btn.loading .spin { display: inline; }
+    #scan-btn.loading .idle { display: none; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Main content ───────────────────────────────────────── */
+    main { flex: 1; padding: 2rem; max-width: 1400px; margin: 0 auto; width: 100%; }
+
+    /* ── Toast ──────────────────────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: .85rem 1.25rem;
+      font-size: .88rem;
+      display: flex; align-items: center; gap: .6rem;
+      opacity: 0;
+      transform: translateY(12px);
+      transition: all .3s ease;
+      pointer-events: none;
+      z-index: 999;
+      max-width: 320px;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+    #toast.success { border-color: var(--green); }
+    #toast.error   { border-color: var(--rose); }
+
+    /* ── KPI Cards ──────────────────────────────────────────── */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+
+    .kpi-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: .5rem;
+      position: relative;
+      overflow: hidden;
+      transition: transform var(--transition), box-shadow var(--transition);
+    }
+
+    .kpi-card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, var(--kpi-color, var(--accent)) 0%, transparent 60%);
+      opacity: .06;
+    }
+
+    .kpi-card:hover { transform: translateY(-3px); box-shadow: var(--shadow); }
+
+    .kpi-icon {
+      width: 44px; height: 44px;
+      background: color-mix(in srgb, var(--kpi-color, var(--accent)) 15%, transparent);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.3rem;
+      margin-bottom: .25rem;
+    }
+
+    .kpi-label {
+      font-size: .78rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      font-weight: 500;
+    }
+
+    .kpi-value {
+      font-size: 2.4rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1;
+    }
+
+    .kpi-badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: .75rem;
+      font-weight: 600;
+      padding: .2rem .5rem;
+      border-radius: 20px;
+      margin-top: .25rem;
+      background: color-mix(in srgb, var(--kpi-color, var(--accent)) 15%, transparent);
+      color: var(--kpi-color, var(--accent));
+    }
+
+    /* ── Charts Row ─────────────────────────────────────────── */
+    .charts-row {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+
+    @media (max-width: 900px) {
+      .charts-row { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 1.5rem;
+    }
+
+    .card-title {
+      font-size: .92rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+    }
+
+    .card-title span { color: var(--muted); font-weight: 400; font-size: .8rem; }
+
+    /* ── Bottom row ─────────────────────────────────────────── */
+    .bottom-row {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+
+    @media (max-width: 1000px) {
+      .bottom-row { grid-template-columns: 1fr; }
+    }
+
+    /* ── Companies bar ──────────────────────────────────────── */
+    .company-list { display: flex; flex-direction: column; gap: .65rem; }
+
+    .company-row {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      font-size: .88rem;
+    }
+
+    .company-name {
+      width: 130px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .company-bar-wrap {
+      flex: 1;
+      height: 8px;
+      background: var(--bg4);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .company-bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 4px;
+      transition: width .6s ease;
+    }
+
+    .company-count {
+      width: 28px;
+      text-align: right;
+      color: var(--muted);
+      font-size: .8rem;
+      font-weight: 600;
+    }
+
+    /* ── Data Table ─────────────────────────────────────────── */
+    .table-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .table-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.25rem;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    .table-controls {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      flex-wrap: wrap;
+    }
+
+    .search-wrap {
+      position: relative;
+    }
+
+    .search-wrap svg {
+      position: absolute;
+      left: .85rem;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      pointer-events: none;
+    }
+
+    #search-input {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .6rem .9rem .6rem 2.4rem;
+      color: var(--text);
+      font-family: inherit;
+      font-size: .88rem;
+      width: 240px;
+      transition: border-color var(--transition);
+    }
+    #search-input:focus { outline: none; border-color: var(--accent); }
+    #search-input::placeholder { color: var(--muted); }
+
+    .filter-select {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .6rem .9rem;
+      color: var(--text);
+      font-family: inherit;
+      font-size: .88rem;
+      cursor: pointer;
+    }
+    .filter-select:focus { outline: none; border-color: var(--accent); }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .88rem;
+    }
+
+    thead th {
+      text-align: left;
+      padding: .75rem 1rem;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: .78rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+    }
+    thead th:hover { color: var(--text); }
+    thead th.sorted { color: var(--accent); }
+    thead th .sort-icon { margin-left: .25rem; opacity: .5; }
+    thead th.sorted .sort-icon { opacity: 1; }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background var(--transition);
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: var(--bg3); }
+
+    tbody td {
+      padding: .85rem 1rem;
+      vertical-align: middle;
+    }
+
+    .td-date   { color: var(--muted); white-space: nowrap; font-size: .82rem; }
+    .td-company{ font-weight: 600; }
+    .td-title  { color: var(--text); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .td-sender { color: var(--muted); font-size: .82rem; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: .25rem .65rem;
+      border-radius: 20px;
+      font-size: .75rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .badge-Applied   { background: rgba(59,130,246,.15);  color: var(--blue); }
+    .badge-Interview { background: rgba(245,158,11,.15);  color: var(--amber); }
+    .badge-Offer     { background: rgba(34,197,94,.15);   color: var(--green); }
+    .badge-Rejected  { background: rgba(244,63,94,.15);   color: var(--rose); }
+    .badge-default   { background: rgba(124,133,176,.15); color: var(--muted); }
+
+    /* Pagination */
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 1.25rem;
+      font-size: .85rem;
+      color: var(--muted);
+    }
+
+    .page-btns { display: flex; gap: .4rem; }
+
+    .page-btn {
+      width: 34px; height: 34px;
+      border: 1px solid var(--border);
+      background: var(--bg3);
+      color: var(--text);
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: .85rem;
+      transition: var(--transition);
+    }
+    .page-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .page-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .page-btn:disabled { opacity: .35; pointer-events: none; }
+
+    /* ── Empty state ────────────────────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--muted);
+    }
+    .empty-state .icon { font-size: 3rem; margin-bottom: .75rem; }
+    .empty-state p { font-size: .95rem; }
+
+    /* ── Loading skeleton ───────────────────────────────────── */
+    .skeleton {
+      background: linear-gradient(90deg, var(--bg3) 25%, var(--bg4) 50%, var(--bg3) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.4s infinite;
+      border-radius: 6px;
+    }
+    @keyframes shimmer { to { background-position: -200% 0; } }
+
+    /* ── Footer ─────────────────────────────────────────────── */
+    footer {
+      text-align: center;
+      padding: 1.5rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: .8rem;
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Header ──────────────────────────────────────────── -->
+  <header>
+    <div class="header-brand">
+      <div class="logo-icon">📬</div>
+      <div class="brand-text">
+        <h1>Application Tracker</h1>
+        <p>Outlook · Job Search Analytics</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span class="last-sync" id="last-sync-label">—</span>
+      <button id="scan-btn" onclick="triggerScan()">
+        <span class="idle">🔄 Scan Outlook</span>
+        <span class="spin">⟳</span>
+        <span class="spin" style="margin-left:.25rem">Scanning…</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Main ────────────────────────────────────────────── -->
+  <main>
+
+    <!-- KPI Cards -->
+    <div class="kpi-grid" id="kpi-grid">
+      <!-- injected by JS -->
+    </div>
+
+    <!-- Charts row -->
+    <div class="charts-row">
+      <div class="card">
+        <div class="card-title">🍩 Status Breakdown</div>
+        <canvas id="donutChart" height="240"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">📅 Applications Over Time <span>last 12 months</span></div>
+        <canvas id="timelineChart" height="220"></canvas>
+      </div>
+    </div>
+
+    <!-- Bottom row: table + companies -->
+    <div class="bottom-row">
+
+      <!-- Table -->
+      <div class="table-card" style="height:fit-content;">
+        <div class="table-header">
+          <div class="card-title" style="margin:0">📋 All Applications</div>
+          <div class="table-controls">
+            <div class="search-wrap">
+              <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+              <input id="search-input" type="text" placeholder="Search company, title…" oninput="onSearch()" />
+            </div>
+            <select class="filter-select" id="status-filter" onchange="onSearch()">
+              <option value="">All statuses</option>
+              <option value="Applied">Applied</option>
+              <option value="Interview">Interview</option>
+              <option value="Offer">Offer</option>
+              <option value="Rejected">Rejected</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table id="apps-table">
+            <thead>
+              <tr>
+                <th onclick="setSort('date')"    id="th-date">Date <span class="sort-icon">↕</span></th>
+                <th onclick="setSort('company')" id="th-company">Company <span class="sort-icon">↕</span></th>
+                <th onclick="setSort('job_title')" id="th-job_title">Job Title <span class="sort-icon">↕</span></th>
+                <th onclick="setSort('status')"  id="th-status">Status <span class="sort-icon">↕</span></th>
+                <th>Sender</th>
+              </tr>
+            </thead>
+            <tbody id="apps-body">
+              <tr>
+                <td colspan="5">
+                  <div class="empty-state">
+                    <div class="icon">⏳</div>
+                    <p>Loading applications…</p>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pagination" id="pagination-row">
+          <span id="pagination-info"></span>
+          <div class="page-btns" id="page-btns"></div>
+        </div>
+      </div>
+
+      <!-- Top Companies -->
+      <div class="card" style="height: fit-content; align-self: start;">
+        <div class="card-title">🏢 Top Companies</div>
+        <div class="company-list" id="company-list">
+          <p style="color:var(--muted); font-size:.85rem;">Loading…</p>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <footer>Job Application Tracker &mdash; All data is stored locally &amp; never leaves your machine.</footer>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let currentPage = 1;
+let currentSort = 'date';
+let currentOrder = 'desc';
+let searchDebounce;
+let donutChart, timelineChart;
+
+const STATUS_COLORS = {
+  Applied:   { bg: 'rgba(59,130,246,.8)',  border: '#3b82f6' },
+  Interview: { bg: 'rgba(245,158,11,.8)',  border: '#f59e0b' },
+  Offer:     { bg: 'rgba(34,197,94,.8)',   border: '#22c55e' },
+  Rejected:  { bg: 'rgba(244,63,94,.8)',   border: '#f43f5e' },
+};
+
+// ── Init ───────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  loadStats();
+  loadApplications();
+  document.getElementById('last-sync-label').textContent = 'Last scan: ' + new Date().toLocaleDateString();
+});
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+async function loadStats() {
+  const res = await fetch('/api/stats');
+  const d   = await res.json();
+  renderKPIs(d);
+  renderDonut(d.status_chart);
+  renderTimeline(d.monthly);
+  renderCompanies(d.top_companies);
+}
+
+function renderKPIs(d) {
+  const cards = [
+    { label: 'Total Applied',  value: d.total,     icon: '📨', color: '#6c63ff', badge: 'All time' },
+    { label: 'Interviews',     value: d.interview,  icon: '🗓️', color: '#f59e0b', badge: 'Active pipeline' },
+    { label: 'Offers',         value: d.offer,      icon: '🎉', color: '#22c55e', badge: 'Congratulations!' },
+    { label: 'Rejections',     value: d.rejected,   icon: '❌', color: '#f43f5e', badge: 'Keep going!' },
+    { label: 'In Progress',    value: d.applied,    icon: '⏳', color: '#14b8a6', badge: 'Awaiting reply' },
+  ];
+
+  const grid = document.getElementById('kpi-grid');
+  grid.innerHTML = cards.map(c => `
+    <div class="kpi-card" style="--kpi-color:${c.color}">
+      <div class="kpi-icon">${c.icon}</div>
+      <div class="kpi-label">${c.label}</div>
+      <div class="kpi-value">${c.value.toLocaleString()}</div>
+      <div class="kpi-badge">${c.badge}</div>
+    </div>
+  `).join('');
+}
+
+function renderDonut(statusChart) {
+  const labels = statusChart.map(s => s.status);
+  const values = statusChart.map(s => s.count);
+  const colors = labels.map(l => (STATUS_COLORS[l] || { bg:'rgba(124,133,176,.7)' }).bg);
+  const borders= labels.map(l => (STATUS_COLORS[l] || { border:'#7c85b0' }).border);
+
+  if (donutChart) donutChart.destroy();
+  donutChart = new Chart(document.getElementById('donutChart'), {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data: values, backgroundColor: colors, borderColor: borders, borderWidth: 2, hoverOffset: 8 }] },
+    options: {
+      cutout: '68%',
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#7c85b0', boxWidth: 12, padding: 16, font: { family: 'Inter', size: 12 } } },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` ${ctx.label}: ${ctx.parsed} (${Math.round(ctx.parsed / ctx.dataset.data.reduce((a,b)=>a+b,0)*100)}%)`,
+          }
+        }
+      },
+    }
+  });
+}
+
+function renderTimeline(monthly) {
+  if (!monthly.length) return;
+  const labels = monthly.map(m => {
+    const [y, mo] = m.month.split('-');
+    return new Date(y, mo-1).toLocaleString('default', { month: 'short', year: '2-digit' });
+  });
+  const values = monthly.map(m => m.count);
+
+  if (timelineChart) timelineChart.destroy();
+  timelineChart = new Chart(document.getElementById('timelineChart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Applications',
+        data: values,
+        backgroundColor: 'rgba(108,99,255,.7)',
+        borderColor: '#6c63ff',
+        borderWidth: 1,
+        borderRadius: 6,
+        hoverBackgroundColor: 'rgba(139,92,246,.9)',
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y} application${ctx.parsed.y !== 1 ? 's' : ''}` } }
+      },
+      scales: {
+        x: { ticks: { color: '#7c85b0', font: { family: 'Inter', size: 11 } }, grid: { color: 'rgba(42,46,74,.5)' } },
+        y: { ticks: { color: '#7c85b0', font: { family: 'Inter', size: 11 }, stepSize: 1 }, grid: { color: 'rgba(42,46,74,.5)' }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+function renderCompanies(companies) {
+  const max = companies[0]?.count || 1;
+  const el = document.getElementById('company-list');
+  if (!companies.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:.85rem">No data yet — run a scan!</p>';
+    return;
+  }
+  el.innerHTML = companies.map(c => `
+    <div class="company-row">
+      <div class="company-name" title="${c.company}">${c.company}</div>
+      <div class="company-bar-wrap">
+        <div class="company-bar" style="width:${Math.round(c.count/max*100)}%"></div>
+      </div>
+      <div class="company-count">${c.count}</div>
+    </div>
+  `).join('');
+}
+
+// ── Applications Table ─────────────────────────────────────────────────────
+async function loadApplications() {
+  const q      = document.getElementById('search-input').value.trim();
+  const status = document.getElementById('status-filter').value;
+  const params = new URLSearchParams({ q, status, sort: currentSort, order: currentOrder, page: currentPage });
+  const res    = await fetch(`/api/applications?${params}`);
+  const d      = await res.json();
+  renderTable(d);
+}
+
+function renderTable({ items, total, page, pages }) {
+  const body = document.getElementById('apps-body');
+
+  if (!items.length) {
+    body.innerHTML = `<tr><td colspan="5"><div class="empty-state"><div class="icon">🔍</div><p>No applications found. Try scanning Outlook first!</p></div></td></tr>`;
+    document.getElementById('pagination-info').textContent = '';
+    document.getElementById('page-btns').innerHTML = '';
+    return;
+  }
+
+  body.innerHTML = items.map(a => {
+    const badgeClass = STATUS_COLORS[a.status] ? `badge-${a.status}` : 'badge-default';
+    const dateStr = a.date ? new Date(a.date+'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+    return `
+      <tr>
+        <td class="td-date">${dateStr}</td>
+        <td class="td-company">${esc(a.company || '—')}</td>
+        <td class="td-title" title="${esc(a.job_title)}">${esc(a.job_title || '—')}</td>
+        <td><span class="badge ${badgeClass}">${a.status}</span></td>
+        <td class="td-sender" title="${esc(a.sender)}">${esc(a.sender || '—')}</td>
+      </tr>
+    `;
+  }).join('');
+
+  // Pagination info
+  const start = (page - 1) * 25 + 1;
+  const end   = Math.min(page * 25, total);
+  document.getElementById('pagination-info').textContent = `Showing ${start}–${end} of ${total}`;
+
+  // Pagination buttons
+  const pageBtns = document.getElementById('page-btns');
+  const maxBtns  = 7;
+  const half     = Math.floor(maxBtns / 2);
+  let startPage  = Math.max(1, page - half);
+  let endPage    = Math.min(pages, startPage + maxBtns - 1);
+  if (endPage - startPage < maxBtns - 1) startPage = Math.max(1, endPage - maxBtns + 1);
+
+  let btns = '';
+  btns += `<button class="page-btn" onclick="gotoPage(${page-1})" ${page===1?'disabled':''}>‹</button>`;
+  for (let i = startPage; i <= endPage; i++) {
+    btns += `<button class="page-btn${i===page?' active':''}" onclick="gotoPage(${i})">${i}</button>`;
+  }
+  btns += `<button class="page-btn" onclick="gotoPage(${page+1})" ${page===pages?'disabled':''}>›</button>`;
+  pageBtns.innerHTML = btns;
+
+  // Update sort indicators
+  document.querySelectorAll('thead th').forEach(th => th.classList.remove('sorted'));
+  const sorted = document.getElementById('th-'+currentSort);
+  if (sorted) {
+    sorted.classList.add('sorted');
+    sorted.querySelector('.sort-icon').textContent = currentOrder === 'asc' ? '↑' : '↓';
+  }
+}
+
+function gotoPage(p) {
+  currentPage = p;
+  loadApplications();
+}
+
+function setSort(col) {
+  if (currentSort === col) {
+    currentOrder = currentOrder === 'asc' ? 'desc' : 'asc';
+  } else {
+    currentSort = col;
+    currentOrder = 'desc';
+  }
+  currentPage = 1;
+  loadApplications();
+}
+
+function onSearch() {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => {
+    currentPage = 1;
+    loadApplications();
+  }, 300);
+}
+
+// ── Scan ───────────────────────────────────────────────────────────────────
+async function triggerScan() {
+  const btn = document.getElementById('scan-btn');
+  btn.classList.add('loading');
+  showToast('🔍 Scanning your Outlook inbox…', 'info');
+
+  try {
+    const res = await fetch('/api/scan', { method: 'POST' });
+    const d   = await res.json();
+    if (d.ok) {
+      showToast(`✅ Found ${d.new} new application${d.new!==1?'s':''}! (${d.total} total)`, 'success');
+      await loadStats();
+      currentPage = 1;
+      await loadApplications();
+      document.getElementById('last-sync-label').textContent = 'Last scan: ' + new Date().toLocaleTimeString();
+    } else {
+      showToast('❌ Scan failed: ' + (d.error || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showToast('❌ Could not reach the server.', 'error');
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+// ── Utilities ──────────────────────────────────────────────────────────────
+function esc(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function showToast(msg, type='info') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className   = `toast show ${type}`;
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('show'), 4000);
+}
+</script>
+</body>
+</html>
