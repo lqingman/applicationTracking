@@ -15,6 +15,26 @@ import requests
 
 # ── Keyword fallback data ─────────────────────────────────────────────────────
 
+# Patterns that indicate a digest, newsletter, or platform notification — NOT
+# an actual job-application status email.  Checked BEFORE the keyword filter.
+_DIGEST_PATTERNS = [
+    "daily digest",
+    "weekly digest",
+    "digest email",
+    "newsletter",
+    "unsubscribe",
+    "job alert",
+    "jobs you may like",
+    "recommended jobs",
+    "new jobs for you",
+    "workday inbox",           # Workday platform digest
+    "notification digest",
+    "activity digest",
+    "your daily summary",
+    "your weekly summary",
+    "digest for",
+]
+
 _JOB_KEYWORDS = [
     "application", "applied", "applicant",
     "interview", "interviewer", "schedule a call",
@@ -72,10 +92,15 @@ _GENERIC_DOMAINS = {
 def is_job_email_fast(subject: str, body_preview: str) -> bool:
     """
     Fast keyword pre-filter — no API call.
-    Returns True if the email shows any job-related signal.
+    Returns True if the email shows any job-related signal AND is not a
+    digest / newsletter / platform notification.
     Used as Stage 1 to avoid wasting AI calls on obvious non-matches.
     """
     text = (subject + " " + body_preview).lower()
+    # Reject digests / newsletters first — they often contain job keywords
+    # incidentally but are never actual application-status emails.
+    if any(pat in text for pat in _DIGEST_PATTERNS):
+        return False
     return any(kw in text for kw in _JOB_KEYWORDS)
 
 
@@ -128,8 +153,8 @@ Analyze this email and classify it:
 
 Subject: {subject}
 From: {sender_name} <{sender_email}>
-Body preview:
-{body_preview}
+Body:
+{body}
 
 Return a JSON object with EXACTLY these fields:
 {{
@@ -141,7 +166,16 @@ Return a JSON object with EXACTLY these fields:
 }}
 
 Classification rules:
-- is_job_email: true ONLY if this is clearly about a job application process.
+- is_job_email: true ONLY if this email is a direct status update for a
+  specific job application the candidate submitted.
+  Set is_job_email to FALSE for:
+    * Digest or summary emails (e.g. "Your Daily Digest", "Workday Inbox",
+      "Weekly Digest", "Notification Digest")
+    * Newsletter or marketing emails
+    * Job-board recommendation emails ("Jobs you may like", "New jobs for you")
+    * Platform notification emails that are not tied to a specific application
+    * Any email where the subject or body indicates it is a bulk/aggregated
+      summary rather than a direct response to a specific application
 - company: the ACTUAL hiring employer's name.
   IMPORTANT: Workday, Greenhouse, Lever, iCIMS, Taleo, Jobvite, SmartRecruiters
   and similar are ATS PLATFORMS — never use them as the company.
@@ -173,10 +207,10 @@ def _ai_classify(subject, body_preview, sender_name, sender_email, api_key, mode
     Retries once on network/timeout errors before giving up.
     """
     prompt = _USER_PROMPT_TPL.format(
-        subject=subject[:300],
-        sender_name=sender_name[:100],
-        sender_email=sender_email[:100],
-        body_preview=body_preview[:800],
+        subject=subject,
+        sender_name=sender_name,
+        sender_email=sender_email,
+        body=body_preview,
     )
     payload = {
         "model": model,
