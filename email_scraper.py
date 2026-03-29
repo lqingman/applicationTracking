@@ -1,19 +1,32 @@
 """
 email_scraper.py
-Reads emails directly from your locally installed Outlook desktop app
-using Windows COM automation (pywin32).
+Reads emails from your locally installed Outlook desktop app via COM automation.
 
-✅ No Azure portal, no app registration, no tokens.
-   Works with any account already signed into Outlook — including school SSO.
+Pipeline:
+  1. Stage 1 — fast keyword pre-filter (no API cost)
+  2. Stage 2 — OpenRouter AI classification (company, job title, status)
+  3. Stage 3 — fuzzy-match to existing application, or create new
+              → status only advances (Offer > Interview > Applied; Rejected wins)
+
+Database schema (two tables):
+  applications  — one row per unique job application
+  email_events  — one row per email (status timeline for each application)
 """
 
-import sqlite3
-import re
 import os
+import re
+import sqlite3
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+
+# ── dotenv ────────────────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # python-dotenv not installed; key must be in environment already
 
 # ── COM / Outlook ─────────────────────────────────────────────────────────────
-
 try:
     import win32com.client
 except ImportError:
@@ -22,142 +35,259 @@ except ImportError:
     raise SystemExit(1)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-
 try:
     import config
-    OUTLOOK_FOLDER = getattr(config, "OUTLOOK_FOLDER", "Inbox")
-    SCAN_JUNK      = getattr(config, "SCAN_JUNK", True)
-    SCAN_DAYS      = getattr(config, "SCAN_DAYS", 730)
+    OUTLOOK_FOLDER     = getattr(config, "OUTLOOK_FOLDER", "Inbox")
+    SCAN_JUNK          = getattr(config, "SCAN_JUNK", True)
+    SCAN_DAYS          = getattr(config, "SCAN_DAYS", 730)
+    OPENROUTER_MODEL   = getattr(config, "OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    AI_ENABLED         = getattr(config, "AI_ENABLED", True)
+    AI_MATCH_THRESHOLD = getattr(config, "AI_MATCH_THRESHOLD", 0.75)
 except ImportError:
     print("✗  config.py not found.")
     raise SystemExit(1)
 
+# Load API key from environment (.env file)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+from ai_classifier import classify_email, is_job_email_fast
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "applications.db")
 
-# ── Keywords ──────────────────────────────────────────────────────────────────
+# ── Status priority ───────────────────────────────────────────────────────────
+# Rejected always wins (terminal state). Otherwise status can only advance.
+STATUS_PRIORITY = {
+    "Unknown":   0,
+    "Applied":   1,
+    "Interview": 2,
+    "Offer":     3,
+    "Rejected":  99,
+}
 
-JOB_KEYWORDS = [
-    "application", "applied", "applicant",
-    "interview", "interviewer", "schedule a call",
-    "job offer", "offer letter", "offer of employment",
-    "hiring", "recruiter", "recruitment",
-    "position", "job posting", "opening",
-    "resume", "cv", "cover letter",
-    "rejection", "unfortunately", "not moving forward",
-    "thank you for applying", "we received your application",
-    "background check", "onboarding",
-    "salary", "compensation", "start date",
-    "assessment", "coding challenge", "take-home",
-    "technical screen", "phone screen",
-    "final round", "next steps",
-]
 
-STATUS_RULES = [
-    ("Offer",     ["offer letter", "offer of employment", "pleased to offer",
-                   "job offer", "onboarding", "start date", "background check",
-                   "congratulations"]),
-    ("Interview", ["interview", "schedule a call", "phone screen",
-                   "technical screen", "coding challenge", "take-home",
-                   "assessment", "next round", "final round", "next steps",
-                   "meet with"]),
-    ("Rejected",  ["unfortunately", "not moving forward", "will not be moving",
-                   "other candidates", "not selected", "no longer considering",
-                   "position has been filled", "regret to inform",
-                   "decided to move", "not a fit", "unable to offer"]),
-    ("Applied",   ["we received your application", "thank you for applying",
-                   "application received", "application submitted",
-                   "application has been", "confirm your application",
-                   "application for", "applied for"]),
-]
-
-# ── Database ───────────────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 
 def init_db():
+    """
+    Create or migrate the database.
+
+    New schema (v2):
+      applications  — one row per unique job application
+      email_events  — one row per email / status event
+
+    If the old single-table schema is detected (email_id column in applications),
+    it is automatically migrated to the new schema.
+    """
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("""
+
+    # ── Detect old schema ─────────────────────────────────────────────────────
+    c.execute("PRAGMA table_info(applications)")
+    cols = {row["name"] for row in c.fetchall()}
+
+    if "email_id" in cols:
+        # Old schema detected → migrate
+        _migrate_old_schema(conn)
+    else:
+        # Fresh install — create new tables
+        _create_tables(conn)
+
+    conn.close()
+
+
+def _create_tables(conn):
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS applications (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            email_id    TEXT    UNIQUE,
-            date        TEXT,
-            company     TEXT,
-            job_title   TEXT,
-            status      TEXT,
-            sender      TEXT,
-            subject     TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        )
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            company      TEXT,
+            job_title    TEXT,
+            status       TEXT,
+            applied_date TEXT,
+            last_update  TEXT,
+            sender       TEXT,
+            subject      TEXT,
+            ai_used      INTEGER DEFAULT 0,
+            created_at   TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS email_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_id INTEGER REFERENCES applications(id),
+            email_id       TEXT UNIQUE,
+            date           TEXT,
+            status         TEXT,
+            subject        TEXT,
+            sender         TEXT,
+            created_at     TEXT DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
-    conn.close()
 
-def save_application(record: dict):
-    conn = sqlite3.connect(DB_PATH)
+
+def _migrate_old_schema(conn):
+    """Migrate old single-table schema to new two-table schema."""
+    print("  ℹ️  Migrating database to new schema (v2)…")
     c = conn.cursor()
-    c.execute("""
-        INSERT OR IGNORE INTO applications
-            (email_id, date, company, job_title, status, sender, subject)
-        VALUES
-            (:email_id, :date, :company, :job_title, :status, :sender, :subject)
-    """, record)
+
+    # Rename old table
+    c.execute("ALTER TABLE applications RENAME TO applications_v1")
+
+    # Create new tables
+    _create_tables(conn)
+
+    # Migrate: each old row becomes one application + one email_event
+    rows = c.execute("""
+        SELECT email_id, date, company, job_title, status, sender, subject, created_at
+        FROM applications_v1
+    """).fetchall()
+
+    migrated = 0
+    for row in rows:
+        try:
+            c.execute("""
+                INSERT INTO applications
+                    (company, job_title, status, applied_date, last_update,
+                     sender, subject, ai_used, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """, (
+                row["company"], row["job_title"], row["status"],
+                row["date"], row["date"],
+                row["sender"], row["subject"], row["created_at"],
+            ))
+            app_id = c.lastrowid
+            c.execute("""
+                INSERT OR IGNORE INTO email_events
+                    (application_id, email_id, date, status, subject, sender)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                app_id, row["email_id"], row["date"],
+                row["status"], row["subject"], row["sender"],
+            ))
+            migrated += 1
+        except Exception as e:
+            print(f"    Warning: could not migrate row — {e}")
+
     conn.commit()
-    conn.close()
+    print(f"  ✓ Migrated {migrated} records to new schema")
 
-# ── Classification helpers ────────────────────────────────────────────────────
 
-def is_job_email(subject: str, body_preview: str) -> bool:
-    text = (subject + " " + body_preview).lower()
-    return any(kw in text for kw in JOB_KEYWORDS)
+# ── Application grouping ──────────────────────────────────────────────────────
 
-def classify_status(subject: str, body_preview: str) -> str:
-    text = (subject + " " + body_preview).lower()
-    for status, keywords in STATUS_RULES:
-        if any(kw in text for kw in keywords):
-            return status
-    return "Applied"
+def _normalize(text: str) -> str:
+    """Lowercase, strip punctuation for fuzzy comparison."""
+    return re.sub(r"[^\w\s]", "", text.lower()).strip()
 
-def extract_company(sender_name: str, sender_email: str) -> str:
-    generic = {"greenhouse.io", "lever.co", "workday.com", "taleo.net",
-               "icims.com", "jobvite.com", "smartrecruiters.com",
-               "successfactors.com", "brassring.com", "gmail.com",
-               "outlook.com", "yahoo.com", "hotmail.com", "noreply.com",
-               "mail.com", "notifications.linkedin.com", "linkedin.com",
-               "indeed.com", "glassdoor.com", "ziprecruiter.com"}
-    if "@" in sender_email:
-        domain = sender_email.split("@")[-1].lower()
-        if domain not in generic:
-            root = domain.split(".")[0]
-            return root.capitalize()
-    if sender_name:
-        parts = sender_name.strip().split()[:2]
-        return " ".join(parts)
-    return "Unknown"
 
-def extract_job_title(subject: str) -> str:
-    patterns = [
-        r"(?:application for|applying for|position[:\s]+|role[:\s]+)(.+)",
-        r"(?:your application|application received)[^\-–—]*[-–—]\s*(.+)",
-    ]
-    for p in patterns:
-        m = re.search(p, subject, re.IGNORECASE)
-        if m:
-            title = m.group(1).strip(" .,;:")
-            if 3 < len(title) < 120:
-                return title[:100]
-    return subject[:100]
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
+
+
+def _compute_status(conn, application_id: int) -> str:
+    """
+    Derive the application's current status from all its email_events.
+    Rejected always wins. Otherwise return highest-priority status.
+    """
+    rows = conn.execute(
+        "SELECT status FROM email_events WHERE application_id = ?",
+        (application_id,)
+    ).fetchall()
+    if not rows:
+        return "Applied"
+    statuses = [r["status"] for r in rows]
+    if "Rejected" in statuses:
+        return "Rejected"
+    return max(statuses, key=lambda s: STATUS_PRIORITY.get(s, 0))
+
+
+def find_or_create_application(conn, company: str, job_title: str,
+                                date_str: str, sender: str,
+                                subject: str, ai_used: bool) -> tuple:
+    """
+    Fuzzy-match company + job_title against existing applications.
+    Returns (application_id: int, is_new: bool).
+    """
+    threshold = AI_MATCH_THRESHOLD
+
+    # Skip fuzzy matching if company or job_title is too generic
+    skip_match = company.lower() in ("unknown", "") or job_title.lower() in ("unknown", "")
+
+    if not skip_match:
+        rows = conn.execute(
+            "SELECT id, company, job_title FROM applications"
+        ).fetchall()
+
+        best_id    = None
+        best_score = 0.0
+        for row in rows:
+            co_sim    = _similarity(company,   row["company"])
+            ti_sim    = _similarity(job_title, row["job_title"])
+            # Both must independently meet threshold
+            if co_sim >= threshold and ti_sim >= threshold:
+                score = (co_sim + ti_sim) / 2
+                if score > best_score:
+                    best_score = score
+                    best_id    = row["id"]
+
+        if best_id is not None:
+            # Update last_update timestamp
+            conn.execute(
+                "UPDATE applications SET last_update = ? WHERE id = ?",
+                (date_str, best_id)
+            )
+            return best_id, False
+
+    # Create a new application record
+    conn.execute("""
+        INSERT INTO applications
+            (company, job_title, status, applied_date, last_update,
+             sender, subject, ai_used)
+        VALUES (?, ?, 'Applied', ?, ?, ?, ?, ?)
+    """, (company, job_title, date_str, date_str,
+          sender, subject, int(ai_used)))
+    conn.commit()
+    app_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return app_id, True
+
+
+def add_email_event(conn, application_id: int, email_id: str, date_str: str,
+                    status: str, subject: str, sender: str) -> bool:
+    """
+    Insert a new email_event row.
+    Returns True if inserted, False if already exists (duplicate).
+    """
+    try:
+        conn.execute("""
+            INSERT INTO email_events
+                (application_id, email_id, date, status, subject, sender)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (application_id, email_id, date_str, status,
+              subject[:255], sender[:255]))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False   # duplicate email_id
+
+
+def refresh_application_status(conn, application_id: int):
+    """Recompute and write the application's current status from all its events."""
+    new_status = _compute_status(conn, application_id)
+    conn.execute(
+        "UPDATE applications SET status = ? WHERE id = ?",
+        (new_status, application_id)
+    )
+    conn.commit()
+
 
 # ── Outlook COM helpers ───────────────────────────────────────────────────────
 
 def _get_outlook_folder(namespace, folder_name: str):
-    """Find a top-level mail folder by name across all accounts."""
-    # Try each account's inbox (handles multiple email accounts in Outlook)
     for store in namespace.Stores:
         try:
             root = store.GetRootFolder()
             for folder in root.Folders:
                 if folder.Name.lower() == folder_name.lower():
                     return folder
-                # Also check one level down (e.g. account root → Inbox)
                 try:
                     sub = folder.Folders[folder_name]
                     return sub
@@ -165,41 +295,32 @@ def _get_outlook_folder(namespace, folder_name: str):
                     pass
         except Exception:
             continue
-
-    # Fallback: use the default Inbox
     try:
-        return namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
+        return namespace.GetDefaultFolder(6)  # olFolderInbox
     except Exception:
         return None
+
 
 def _get_junk_folder(namespace):
-    """Return the Junk Email folder (olFolderJunk = 23)."""
     try:
-        return namespace.GetDefaultFolder(23)
+        return namespace.GetDefaultFolder(23)  # olFolderJunk
     except Exception:
         return None
 
+
 def _iter_folder(folder, cutoff: datetime):
-    """
-    Yield Outlook MailItem objects from a folder that are newer than cutoff.
-    Uses Outlook's built-in filter for performance.
-    """
     if folder is None:
         return
-
-    # Outlook DASL filter — much faster than iterating all items
-    cutoff_str = cutoff.strftime("%m/%d/%Y %I:%M %p")
+    cutoff_str  = cutoff.strftime("%m/%d/%Y %I:%M %p")
     restriction = f"[ReceivedTime] >= '{cutoff_str}'"
-
     try:
-        items = folder.Items
-        items.Sort("[ReceivedTime]", True)   # newest first
+        items    = folder.Items
+        items.Sort("[ReceivedTime]", False)  # oldest first → correct status progression
         filtered = items.Restrict(restriction)
-        count = filtered.Count
+        count    = filtered.Count
         for i in range(1, count + 1):
             try:
                 item = filtered[i]
-                # Only process mail items (class 43), skip calendar/tasks etc.
                 if hasattr(item, "Class") and item.Class == 43:
                     yield item
             except Exception:
@@ -207,12 +328,17 @@ def _iter_folder(folder, cutoff: datetime):
     except Exception as e:
         print(f"  Warning: could not read folder '{folder.Name}': {e}")
 
-# ── Main Scanner ───────────────────────────────────────────────────────────────
+
+# ── Main Scanner ──────────────────────────────────────────────────────────────
 
 def scan_inbox() -> dict:
+    if AI_ENABLED and not OPENROUTER_API_KEY:
+        print("  ⚠️  AI_ENABLED=True but no OPENROUTER_API_KEY found in .env")
+        print("      Falling back to keyword-only classification.")
+
     print("Connecting to Outlook…")
     try:
-        outlook  = win32com.client.Dispatch("Outlook.Application")
+        outlook   = win32com.client.Dispatch("Outlook.Application")
         namespace = outlook.GetNamespace("MAPI")
         namespace.Logon()
         print("  ✓ Connected to Outlook")
@@ -222,16 +348,22 @@ def scan_inbox() -> dict:
         return {"error": str(e), "new": 0, "total": 0}
 
     cutoff = datetime.now() - timedelta(days=SCAN_DAYS)
-    print(f"  Scanning emails since {cutoff.date()}…\n")
+    print(f"  Scanning emails since {cutoff.date()}…")
+    ai_mode = "AI + keyword fallback" if (AI_ENABLED and OPENROUTER_API_KEY) else "keyword-only"
+    print(f"  Classification mode: {ai_mode}\n")
 
     init_db()
-    new_count   = 0
-    match_count = 0
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    new_apps    = 0   # brand-new applications created
+    updated     = 0   # existing applications whose status advanced
+    skipped     = 0   # emails already in DB
     total_seen  = 0
+    match_count = 0
 
-    # Determine which folders to scan
     folders_to_scan = []
-
     inbox = _get_outlook_folder(namespace, OUTLOOK_FOLDER)
     if inbox:
         folders_to_scan.append(("Inbox", inbox))
@@ -248,69 +380,100 @@ def scan_inbox() -> dict:
         folder_count = 0
 
         for item in _iter_folder(folder, cutoff):
-            total_seen += 1
+            total_seen  += 1
             folder_count += 1
 
             try:
-                subject  = str(item.Subject or "")
-                sender   = str(item.SenderName or "")
+                subject      = str(item.Subject or "")
+                sender       = str(item.SenderName or "")
                 sender_email = ""
                 try:
                     sender_email = str(item.SenderEmailAddress or "")
-                    # Exchange internal addresses look like /O=.../CN=... — skip
                     if sender_email.startswith("/O="):
                         sender_email = ""
                 except Exception:
                     pass
 
-                received = item.ReceivedTime  # datetime object from COM
-                # COM datetime → Python datetime
                 try:
-                    date_str = received.strftime("%Y-%m-%d")
+                    date_str = item.ReceivedTime.strftime("%Y-%m-%d")
                 except Exception:
                     date_str = datetime.now().strftime("%Y-%m-%d")
 
-                # Body preview (first 1000 chars)
                 try:
                     body_preview = str(item.Body or "")[:1000]
                 except Exception:
                     body_preview = ""
 
-                if not is_job_email(subject, body_preview):
+                # Stage 1 — fast keyword pre-filter (free)
+                if not is_job_email_fast(subject, body_preview):
                     continue
-
                 match_count += 1
 
-                # Unique email ID using EntryID (stable across restarts)
+                # Stage 2 — AI classification
+                ai_result = classify_email(
+                    subject      = subject,
+                    body_preview = body_preview,
+                    sender_name  = sender,
+                    sender_email = sender_email,
+                    api_key      = OPENROUTER_API_KEY if AI_ENABLED else None,
+                    model        = OPENROUTER_MODEL,
+                    ai_enabled   = AI_ENABLED,
+                )
+
+                # Double-check: AI may reject false positives
+                if not ai_result["is_job_email"]:
+                    continue
+
+                company   = ai_result["company"]
+                job_title = ai_result["job_title"]
+                status    = ai_result["status"] if ai_result["status"] != "Unknown" else "Applied"
+                ai_used   = ai_result["used_ai"]
+
+                sender_full = f"{sender} <{sender_email}>" if sender_email else sender
+
                 try:
                     email_id = str(item.EntryID)[:200]
                 except Exception:
                     email_id = f"{sender_email}_{date_str}_{hash(subject)}"
 
-                company  = extract_company(sender, sender_email)
-                title    = extract_job_title(subject)
-                status_v = classify_status(subject, body_preview)
-                sender_full = f"{sender} <{sender_email}>" if sender_email else sender
+                # Stage 3 — find or create application
+                app_id, is_new = find_or_create_application(
+                    conn, company, job_title, date_str,
+                    sender_full, subject, ai_used
+                )
 
-                # Skip if already in DB
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT 1 FROM applications WHERE email_id = ?", (email_id,))
-                exists = c.fetchone()
-                conn.close()
+                # Add the email event (skip if duplicate)
+                inserted = add_email_event(
+                    conn, app_id, email_id, date_str,
+                    status, subject, sender_full
+                )
 
-                if not exists:
-                    save_application({
-                        "email_id":  email_id,
-                        "date":      date_str,
-                        "company":   company,
-                        "job_title": title,
-                        "status":    status_v,
-                        "sender":    sender_full[:255],
-                        "subject":   subject[:255],
-                    })
-                    new_count += 1
-                    print(f"    [{status_v:9s}] {company:<20s} — {subject[:50]}")
+                if not inserted:
+                    skipped += 1
+                    continue
+
+                # Recompute application status from all events
+                old_status = conn.execute(
+                    "SELECT status FROM applications WHERE id = ?", (app_id,)
+                ).fetchone()["status"]
+
+                refresh_application_status(conn, app_id)
+
+                new_status = conn.execute(
+                    "SELECT status FROM applications WHERE id = ?", (app_id,)
+                ).fetchone()["status"]
+
+                if is_new:
+                    new_apps += 1
+                    tag = "🆕"
+                elif new_status != old_status:
+                    updated += 1
+                    tag = f"📈 {old_status}→{new_status}"
+                else:
+                    tag = "  "
+
+                ai_tag = "🤖" if ai_used else "🔤"
+                print(f"    {ai_tag}[{new_status:9s}] {company:<22} — {subject[:45]}  {tag}")
 
                 if folder_count % 100 == 0:
                     print(f"    … {folder_count} emails checked in {folder_label}")
@@ -321,13 +484,21 @@ def scan_inbox() -> dict:
 
         print(f"  ✓ {folder_label}: checked {folder_count} emails\n")
 
-    conn = sqlite3.connect(DB_PATH)
-    total = conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
     conn.close()
 
-    print(f"✓ Done. Checked {total_seen} emails total, matched {match_count} job emails,")
-    print(f"  added {new_count} new ({total} total in DB).")
-    return {"new": new_count, "total": total}
+    total_apps    = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM applications"
+    ).fetchone()[0]
+    total_events  = sqlite3.connect(DB_PATH).execute(
+        "SELECT COUNT(*) FROM email_events"
+    ).fetchone()[0]
+
+    print(f"✓ Done. Scanned {total_seen} emails, matched {match_count} job emails.")
+    print(f"  New applications: {new_apps}  |  Status updates: {updated}  |"
+          f"  Duplicates skipped: {skipped}")
+    print(f"  DB: {total_apps} applications, {total_events} email events total.")
+
+    return {"new": new_apps, "updated": updated, "total": total_apps}
 
 
 if __name__ == "__main__":
